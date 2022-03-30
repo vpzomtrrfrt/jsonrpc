@@ -12,17 +12,6 @@ pub async fn connect<TClient>(url: &str) -> RpcResult<TClient>
 where
 	TClient: From<RpcChannel>,
 {
-	let url: Uri = url.parse().map_err(|e| RpcError::Other(Box::new(e)))?;
-
-	let (client_api, client_worker) = do_connect(url).await;
-	tokio::spawn(client_worker);
-
-	Ok(TClient::from(client_api))
-}
-
-async fn do_connect(url: Uri) -> (RpcChannel, impl Future<Output = ()>) {
-	let max_parallel = 8;
-
 	#[cfg(feature = "tls")]
 	let connector = hyper_tls::HttpsConnector::new();
 	#[cfg(feature = "tls")]
@@ -30,6 +19,32 @@ async fn do_connect(url: Uri) -> (RpcChannel, impl Future<Output = ()>) {
 
 	#[cfg(not(feature = "tls"))]
 	let client = Client::new();
+
+	connect_with_client(url, client).await
+}
+
+/// Create an HTTP Client given a hyper Client
+pub async fn connect_with_client<
+	C: hyper::client::connect::Connect + Clone + Send + Sync + 'static,
+	TClient: From<RpcChannel>,
+>(
+	url: &str,
+	client: hyper::Client<C>,
+) -> RpcResult<TClient> {
+	let url: Uri = url.parse().map_err(|e| RpcError::Other(Box::new(e)))?;
+
+	let (client_api, client_worker) = do_connect_with_client(url, client).await;
+	tokio::spawn(client_worker);
+
+	Ok(TClient::from(client_api))
+}
+
+async fn do_connect_with_client<C: hyper::client::connect::Connect + Clone + Send + Sync + 'static>(
+	url: Uri,
+	client: hyper::Client<C>,
+) -> (RpcChannel, impl Future<Output = ()>) {
+	let max_parallel = 8;
+
 	// Keep track of internal request IDs when building subsequent requests
 	let mut request_builder = RequestBuilder::new();
 
