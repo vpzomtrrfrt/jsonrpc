@@ -40,13 +40,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{mpsc, Arc, Weak};
+use std::task::{Context, Poll};
 use std::thread;
 
 use parking_lot::Mutex;
 
 use crate::jsonrpc::MetaIoHandler;
 use crate::server_utils::reactor::{Executor, UninitializedExecutor};
-use futures::{channel::oneshot, future};
+use futures::{channel::oneshot, future, ready};
 use hyper::Body;
 use jsonrpc_core as jsonrpc;
 
@@ -509,6 +510,98 @@ where
 			done: Some(done_rxs),
 		})
 	}
+
+	/// Start this JSON-RPC HTTP server trying to bind to specified `SocketAddr` with TLS support.
+	pub fn start_https(self, addr: &SocketAddr, config: Arc<rustls::ServerConfig>) -> io::Result<Server> {
+		let cors_domains = self.cors_domains;
+		let cors_max_age = self.cors_max_age;
+		let allowed_headers = self.allowed_headers;
+		let request_middleware = self.request_middleware;
+		let allowed_hosts = self.allowed_hosts;
+		let jsonrpc_handler = Rpc {
+			handler: self.handler,
+			extractor: self.meta_extractor,
+		};
+		let rest_api = self.rest_api;
+		let health_api = self.health_api;
+		let keep_alive = self.keep_alive;
+		let reuse_port = self.threads > 1;
+
+		let (local_addr_tx, local_addr_rx) = mpsc::channel();
+		let (close, shutdown_signal) = oneshot::channel();
+		let (done_tx, done_rx) = oneshot::channel();
+		let eloop = self.executor.init_with_name("http.worker0")?;
+		let req_max_size = self.max_request_body_size;
+		// The first threads `Executor` is initialised differently from the others
+		serve_tls(
+			config,
+			(shutdown_signal, local_addr_tx, done_tx),
+			eloop.executor(),
+			addr.to_owned(),
+			cors_domains.clone(),
+			cors_max_age,
+			allowed_headers.clone(),
+			request_middleware.clone(),
+			allowed_hosts.clone(),
+			jsonrpc_handler.clone(),
+			rest_api,
+			health_api.clone(),
+			keep_alive,
+			reuse_port,
+			req_max_size,
+		);
+		let handles = (0..self.threads - 1)
+			.map(|i| {
+				let (local_addr_tx, local_addr_rx) = mpsc::channel();
+				let (close, shutdown_signal) = oneshot::channel();
+				let (done_tx, done_rx) = oneshot::channel();
+				let eloop = UninitializedExecutor::Unspawned.init_with_name(format!("http.worker{}", i + 1))?;
+				serve(
+					(shutdown_signal, local_addr_tx, done_tx),
+					eloop.executor(),
+					addr.to_owned(),
+					cors_domains.clone(),
+					cors_max_age,
+					allowed_headers.clone(),
+					request_middleware.clone(),
+					allowed_hosts.clone(),
+					jsonrpc_handler.clone(),
+					rest_api,
+					health_api.clone(),
+					keep_alive,
+					reuse_port,
+					req_max_size,
+				);
+				Ok((eloop, close, local_addr_rx, done_rx))
+			})
+			.collect::<io::Result<Vec<_>>>()?;
+
+		// Wait for server initialization
+		let local_addr = recv_address(local_addr_rx);
+		// Wait for other threads as well.
+		let mut handles: Vec<(Executor, oneshot::Sender<()>, oneshot::Receiver<()>)> = handles
+			.into_iter()
+			.map(|(eloop, close, local_addr_rx, done_rx)| {
+				let _ = recv_address(local_addr_rx)?;
+				Ok((eloop, close, done_rx))
+			})
+			.collect::<io::Result<Vec<_>>>()?;
+		handles.push((eloop, close, done_rx));
+
+		let (executors, done_rxs) = handles
+			.into_iter()
+			.fold((vec![], vec![]), |mut acc, (eloop, closer, done_rx)| {
+				acc.0.push((eloop, closer));
+				acc.1.push(done_rx);
+				acc
+			});
+
+		Ok(Server {
+			address: local_addr?,
+			executors: Arc::new(Mutex::new(Some(executors))),
+			done: Some(done_rxs),
+		})
+	}
 }
 
 fn recv_address(local_addr_rx: mpsc::Receiver<io::Result<SocketAddr>>) -> io::Result<SocketAddr> {
@@ -604,6 +697,228 @@ fn serve<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>>(
 			// Explicitly attempt to recover from accept errors (e.g. too many
 			// files opened) instead of erroring out the entire server.
 			.tcp_sleep_on_accept_errors(true);
+
+		let service_fn = hyper::service::make_service_fn(move |_addr_stream| {
+			let service = ServerHandler::new(
+				jsonrpc_handler.downgrade(),
+				cors_domains.clone(),
+				cors_max_age,
+				allowed_headers.clone(),
+				allowed_hosts.clone(),
+				request_middleware.clone(),
+				rest_api,
+				health_api.clone(),
+				max_request_body_size,
+				keep_alive,
+			);
+			async { Ok::<_, Infallible>(service) }
+		});
+
+		let server = server_builder.serve(service_fn).with_graceful_shutdown(async {
+			if let Err(err) = shutdown_signal.await {
+				debug!("Shutdown signaller dropped, closing server: {:?}", err);
+			}
+		});
+
+		if let Err(err) = server.await {
+			error!("Error running HTTP server: {:?}", err);
+		}
+
+		// FIXME: Work around TCP listener socket not being properly closed
+		// in mio v0.6. This runs the std::net::TcpListener's destructor,
+		// which closes the underlying OS socket.
+		// Remove this once we migrate to Tokio 1.0.
+		#[cfg(windows)]
+		let _: std::net::TcpListener = unsafe { std::os::windows::io::FromRawSocket::from_raw_socket(_raw_socket) };
+
+		done_tx.send(())
+	});
+}
+
+enum TlsStreamState {
+	Handshaking(tokio_rustls::Accept<hyper::server::conn::AddrStream>),
+	Streaming(tokio_rustls::server::TlsStream<hyper::server::conn::AddrStream>),
+}
+
+struct TlsStream {
+	state: TlsStreamState,
+}
+
+impl TlsStream {
+	fn new(stream: hyper::server::conn::AddrStream, config: Arc<rustls::ServerConfig>) -> TlsStream {
+		let accept = tokio_rustls::TlsAcceptor::from(config).accept(stream);
+		TlsStream {
+			state: TlsStreamState::Handshaking(accept),
+		}
+	}
+}
+
+impl tokio::io::AsyncRead for TlsStream {
+	fn poll_read(self: Pin<&mut Self>, cx: &mut Context, buf: &mut tokio::io::ReadBuf) -> Poll<io::Result<()>> {
+		let pin = self.get_mut();
+		match pin.state {
+			TlsStreamState::Handshaking(ref mut accept) => match ready!(Pin::new(accept).poll(cx)) {
+				Ok(mut stream) => {
+					let result = Pin::new(&mut stream).poll_read(cx, buf);
+					pin.state = TlsStreamState::Streaming(stream);
+					result
+				}
+				Err(err) => Poll::Ready(Err(err)),
+			},
+			TlsStreamState::Streaming(ref mut stream) => Pin::new(stream).poll_read(cx, buf),
+		}
+	}
+}
+
+impl tokio::io::AsyncWrite for TlsStream {
+	fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		let pin = self.get_mut();
+		match pin.state {
+			TlsStreamState::Handshaking(ref mut accept) => match ready!(Pin::new(accept).poll(cx)) {
+				Ok(mut stream) => {
+					let result = Pin::new(&mut stream).poll_write(cx, buf);
+					pin.state = TlsStreamState::Streaming(stream);
+					result
+				}
+				Err(err) => Poll::Ready(Err(err)),
+			},
+			TlsStreamState::Streaming(ref mut stream) => Pin::new(stream).poll_write(cx, buf),
+		}
+	}
+
+	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		match self.state {
+			TlsStreamState::Handshaking(_) => Poll::Ready(Ok(())),
+			TlsStreamState::Streaming(ref mut stream) => Pin::new(stream).poll_flush(cx),
+		}
+	}
+
+	fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		match self.state {
+			TlsStreamState::Handshaking(_) => Poll::Ready(Ok(())),
+			TlsStreamState::Streaming(ref mut stream) => Pin::new(stream).poll_shutdown(cx),
+		}
+	}
+}
+
+struct TlsAcceptor {
+	config: Arc<rustls::ServerConfig>,
+	incoming: hyper::server::conn::AddrIncoming,
+}
+
+impl TlsAcceptor {
+	pub fn new(config: Arc<rustls::ServerConfig>, incoming: hyper::server::conn::AddrIncoming) -> TlsAcceptor {
+		TlsAcceptor { config, incoming }
+	}
+}
+
+impl hyper::server::accept::Accept for TlsAcceptor {
+	type Conn = TlsStream;
+	type Error = io::Error;
+
+	fn poll_accept(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Self::Conn, Self::Error>>> {
+		let pin = self.get_mut();
+		match ready!(Pin::new(&mut pin.incoming).poll_accept(cx)) {
+			Some(Ok(sock)) => Poll::Ready(Some(Ok(TlsStream::new(sock, pin.config.clone())))),
+			Some(Err(e)) => Poll::Ready(Some(Err(e))),
+			None => Poll::Ready(None),
+		}
+	}
+}
+
+fn serve_tls<M: jsonrpc::Metadata, S: jsonrpc::Middleware<M>>(
+	tls_config: Arc<rustls::ServerConfig>,
+	signals: (
+		oneshot::Receiver<()>,
+		mpsc::Sender<io::Result<SocketAddr>>,
+		oneshot::Sender<()>,
+	),
+	executor: TaskExecutor,
+	addr: SocketAddr,
+	cors_domains: CorsDomains,
+	cors_max_age: Option<u32>,
+	allowed_headers: cors::AccessControlAllowHeaders,
+	request_middleware: Arc<dyn RequestMiddleware>,
+	allowed_hosts: AllowedHosts,
+	jsonrpc_handler: Rpc<M, S>,
+	rest_api: RestApi,
+	health_api: Option<(String, String)>,
+	keep_alive: bool,
+	reuse_port: bool,
+	max_request_body_size: usize,
+) where
+	S::Future: Unpin,
+	S::CallFuture: Unpin,
+	M: Unpin,
+{
+	let (shutdown_signal, local_addr_tx, done_tx) = signals;
+	executor.spawn(async move {
+		let bind = move || {
+			let listener = match addr {
+				SocketAddr::V4(_) => net2::TcpBuilder::new_v4()?,
+				SocketAddr::V6(_) => net2::TcpBuilder::new_v6()?,
+			};
+			configure_port(reuse_port, &listener)?;
+			listener.reuse_address(true)?;
+			listener.bind(&addr)?;
+			let listener = listener.listen(1024)?;
+			let local_addr = listener.local_addr()?;
+
+			// NOTE: Future-proof by explicitly setting the listener socket to
+			// non-blocking mode of operation (future Tokio/Hyper versions
+			// require for the callers to do that manually)
+			listener.set_nonblocking(true)?;
+			// HACK: See below.
+			#[cfg(windows)]
+			let raw_socket = std::os::windows::io::AsRawSocket::as_raw_socket(&listener);
+			#[cfg(not(windows))]
+			let raw_socket = ();
+
+			let mut incoming = hyper::server::conn::AddrIncoming::from_listener(
+				tokio::net::TcpListener::from_std(listener).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
+			)
+			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+			incoming.set_nodelay(true);
+			// Explicitly attempt to recover from accept errors (e.g. too many
+			// files opened) instead of erroring out the entire server.
+			incoming.set_sleep_on_errors(true);
+
+			let acceptor = TlsAcceptor::new(tls_config, incoming);
+
+			let server_builder = hyper::Server::builder(acceptor);
+			// Add current host to allowed headers.
+			// NOTE: we need to use `l.local_addr()` instead of `addr`
+			// it might be different!
+			Ok((server_builder, local_addr, raw_socket))
+		};
+
+		let bind_result = match bind() {
+			Ok((server_builder, local_addr, raw_socket)) => {
+				// Send local address
+				match local_addr_tx.send(Ok(local_addr)) {
+					Ok(_) => Ok((server_builder, local_addr, raw_socket)),
+					Err(_) => {
+						warn!(
+							"Thread {:?} unable to reach receiver, closing server",
+							thread::current().name()
+						);
+						Err(())
+					}
+				}
+			}
+			Err(err) => {
+				// Send error
+				let _send_result = local_addr_tx.send(Err(err));
+
+				Err(())
+			}
+		};
+
+		let (server_builder, local_addr, _raw_socket) = bind_result?;
+
+		let allowed_hosts = server_utils::hosts::update(allowed_hosts, &local_addr);
+
+		let server_builder = server_builder.http1_keepalive(keep_alive);
 
 		let service_fn = hyper::service::make_service_fn(move |_addr_stream| {
 			let service = ServerHandler::new(
